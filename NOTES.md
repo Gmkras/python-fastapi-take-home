@@ -1,7 +1,7 @@
 # Notes
 
-Draft covering the loader. The API sections (filtering, pagination, API scale) are added with
-that feature. The full reasoning behind each decision is in `specs/001-csv-loader/`.
+Covers the loader and the read API. The full reasoning behind each decision, with the
+alternatives that were discarded, is in `specs/001-csv-loader/` and `specs/002-records-api/`.
 
 ## Schema
 
@@ -22,8 +22,8 @@ that feature. The full reasoning behind each decision is in `specs/001-csv-loade
 - **`load_rejects`**: one row per source line that was not loaded, keyed by
   `(source_file, line_number)`, with the reason, the offending column and value, and the
   original fields. It holds the latest load of each file.
-- Indexes: only the two primary keys so far. Indexes for filters are chosen with the API,
-  each one justified by a query plan.
+- Indexes: the two primary keys and one more, `(country, id)`, in `db/init/003_indexes.sql`.
+  Why only that one is under "Scale (API)".
 
 ## Cleaning and validation
 
@@ -83,6 +83,53 @@ line is taken as a correction of an earlier one. The discarded occurrences are r
 a rejection, not a duplicate, and does not win. This is resolved in SQL over the staged rows,
 not in a Python dict, so it does not depend on the file fitting in memory.
 
+## Filtering and pagination
+
+Four read-only routes, all usable from `/docs`: `GET /records`, `GET /records/summary`,
+`GET /rejects` and `GET /rejects/summary`.
+
+**Filters** on `/records` (and the same ones on the summary):
+
+| Kind | Parameters | Behaviour |
+|---|---|---|
+| Any of several values | `country`, `gender`, `sleep_quality`, `stress_level` | Repeat the parameter; case and surrounding spaces are ignored |
+| Yes / no | `smoking` | |
+| Inclusive range | `min_age`/`max_age`, `min_coffee_intake`/`max_coffee_intake`, `min_bmi`/`max_bmi` | Either end may be left open |
+
+Different filters are combined with AND. I kept the list short on purpose: every filter is a
+question about whether it deserves an index.
+
+- A filter on a column leaves out the records that have no value in it; in a response a
+  missing value is `null`.
+- An unknown country is not an error, it returns an empty page. An unknown category is a 422
+  that lists the accepted values.
+- Parameters are a Pydantic model (`app/filters.py`), so a misspelled one (`min_agee`) is a 422
+  instead of being silently ignored, and every invalid parameter of a request is reported in
+  the same response, including `max_age` below `min_age`.
+- The filters become SQL in one pure function, `build_where`, tested without a database. Client
+  values only ever travel as query parameters.
+
+**Pagination** is by cursor, not by page number: `WHERE id > :after_id ORDER BY id LIMIT :n`.
+The response carries `next_after_id` (null on the last page) and the client sends it back as
+`after_id`. Page size is 50 by default and 200 at most. One extra row is fetched to know whether
+another page exists, so there is no `count(*)`.
+
+Measured on 1 million rows, same page at the end of the table:
+
+| | Rows read | Time |
+|---|---|---|
+| Cursor (`id > ...`) | 51 | 0.06 ms |
+| `OFFSET 993400` | 993,451 | 122 ms |
+
+`OFFSET` reads and throws away every earlier row, so its cost grows with the page number; the
+cursor costs the same anywhere. The cursor is also stable if rows are added during a walk.
+What is given up: jumping to an arbitrary page, and a total in the list (the summary gives it).
+
+`/records/summary` groups by country, gender, sleep quality, stress level or whole cups of
+coffee and returns the count and three averages per group. Records with no value to group by
+form a group whose key is `null`, so the counts always add up to the list with the same filters.
+`/rejects` exposes `load_rejects` with the same pagination rules.
+
 ## Scale (loader)
 
 The file is streamed and validated in chunks of 10,000 rows, each sent with `COPY` to a
@@ -100,7 +147,8 @@ Measured on a development laptop (Windows, Postgres 17 in Docker):
 Memory depends on the chunk size, not on the file size; a bigger chunk bought no speed, so
 the default is 10,000. About half of the time is row validation in Python, the rest is `COPY`
 and the final `MERGE`. Throughput varied between 18,800 and 20,200 rows/s across runs. Time
-grows linearly: 10 million rows would take roughly 8 to 9 minutes.
+grows linearly: 10 million rows would take roughly 8 to 9 minutes. With the API's
+`(country, id)` index in place the same load took 52.8 s, inside that run-to-run variation.
 
 Trade-offs and what I would change for tens of millions of rows:
 
@@ -110,6 +158,55 @@ Trade-offs and what I would change for tens of millions of rows:
 - Validation is single-process. Splitting it across processes is the next step if throughput
   matters; it complicates line numbering and atomicity, so it was left out.
 - Secondary indexes should be created after a bulk load, not maintained row by row during it.
+
+## Scale (API)
+
+Measured on a table of 998,400 rows (Ryzen 7 3700X, 32 GB, Windows 11, Postgres 17 in Docker).
+End-to-end times include validation and serialization; they are medians of 20 requests.
+
+| Request | Time |
+|---|---|
+| First page, no filters | 6.0 ms |
+| Last page, no filters | 7.0 ms |
+| First / last page, `country=Germany` | 7.2 / 6.7 ms |
+| A country that does not exist | 7.4 ms |
+| A filter with no matches and no index (`min_age=119`) | 47.5 ms |
+| Summary by gender, no filters | 183 ms |
+
+**Indexes.** The primary key serves the list and most filters: scanning from the cursor and
+skipping the rows that do not match finds a page almost at once when a filter matches a fair
+share of the table (a country is 5% of it; a combination matching 0.26% took 12 ms). I added
+one index,
+`(country, id)`, and not for the common case: for a country with few rows or none, such as a
+misspelled name, the primary key scan would read the whole table before answering with an
+empty page (110 ms on 1M rows without the index, 0.09 ms with it, and growing with the table).
+Its cost: inserts were 39% slower in isolation, although the full load, dominated by
+validation, did not change measurably; it takes 35 MB per 1.2M rows. One index per filter
+would multiply that cost for filters that the primary key already serves.
+
+**Known worst cases**, accepted and bounded by the time limit below:
+
+- A filter without an index that matches almost nothing scans until it fills the page, or to
+  the end. At tens of millions of rows that would need its own `(column, id)` index, added
+  only for a filter that proves to be both frequent and selective.
+- The unfiltered summary reads the whole table: about 5 s near 27 million rows on this machine.
+  The answer at that size is a small table of aggregates refreshed at the end of each load. It
+  is not built: nothing needs it today.
+
+**Connections.** Routes are plain `def` functions over the synchronous pool that the repo
+already had. The pool is bounded (10 connections by default) and so is time: a request waits at
+most 5 s for a connection and a query may run at most 5 s (`statement_timeout`, set on the
+pool's connections only, so the loader is not affected). When either limit is hit, or the
+database is down, the API answers `503` instead of hanging; with the database stopped it
+answered at once and recovered by itself when the database came back. The pool tests each
+connection before lending it, so a connection the server closed (a restart, an idle timeout)
+is replaced instead of failing a request; that costs one extra round trip, about 0.5 ms here,
+which the times above do not include. All four values are settings (`.env.example`). The rule for sizing: worker processes × pool size must stay below
+Postgres' `max_connections`. Past that point the next step is PgBouncer in front of Postgres,
+or async routes to hold more waiting requests per process; neither was needed here.
+
+Pool connections do not use server-side prepared statements: a cached generic plan cannot tell
+a rare country from a common one and went back to scanning the whole table (180 ms).
 
 ## Lint exceptions
 
