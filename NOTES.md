@@ -1,217 +1,172 @@
 # Notes
 
-Covers the loader and the read API. The full reasoning behind each decision, with the
-alternatives that were discarded, is in `specs/001-csv-loader/` and `specs/002-records-api/`.
+A loader and a read API for the coffee health dataset. With `data/coffee_health_raw.csv` the
+loader stores **9,984 records** and explains each of the **28 rows** it did not load.
 
-## Schema
+Every figure below was measured on my machine (Ryzen 7 3700X, 32 GB, Windows 11, Postgres 17 in
+Docker). The reasoning behind each decision, with the alternatives I discarded, is in `specs/`.
 
-`db/init/002_health_records.sql`
+## 1. Schema
 
-- **`health_records`**: one row per person. The source `ID` is the primary key (`integer`),
-  which is what makes re-loading an update by ID instead of a second insert.
-- One-decimal measures are `numeric(5,1)` / `numeric(6,1)`, not `real`: values stay exact, so
-  range filters and averages carry no floating point noise. `age` and `heart_rate` are
-  `smallint`, the two flags are `boolean`.
-- Categories are `text` with a `CHECK (col IN (...))` rather than native `ENUM`s: same
-  guarantee, and changing a catalog is a plain `ALTER TABLE`. `country` only has a non-blank
-  `CHECK`; its catalog is open-ended and enforced by the loader.
-- Only `id`, `country`, `coffee_intake` and `caffeine_mg` are `NOT NULL`. The other 12 columns
-  may be missing in the source and are stored as `NULL` (see below).
-- Every range and domain the loader enforces is also a `CHECK`, so the database refuses bad
-  data even if something bypasses the loader.
-- **`load_rejects`**: one row per source line that was not loaded, keyed by
-  `(source_file, line_number)`, with the reason, the offending column and value, and the
-  original fields. It holds the latest load of each file.
-- Indexes: the two primary keys and one more, `(country, id)`, in `db/init/003_indexes.sql`.
-  Why only that one is under "Scale (API)".
+`db/init/002_health_records.sql` and `003_indexes.sql`
 
-## Cleaning and validation
+- **`health_records`**, one row per person. The source `ID` is the primary key, which is what
+  lets a re-load update by ID instead of inserting again.
+- One-decimal measures are `numeric(5,1)`, not `real`: values stay exact, so range filters and
+  averages carry no floating point noise. `age` and `heart_rate` are `smallint`; the two flags
+  are `boolean`.
+- Categories are `text` with `CHECK (col IN (...))` rather than `ENUM` types: same guarantee,
+  simpler to change. `country` only has a non-blank check; its catalog lives in the loader.
+- Only `id`, `country`, `coffee_intake` and `caffeine_mg` are `NOT NULL`: they identify the
+  record and are the subject of the dataset. The other 12 columns can be missing in the source
+  and are stored as `NULL`, never imputed.
+- Every range and domain the loader enforces is also a `CHECK`. The database is the second
+  barrier, not the first.
+- **`load_rejects`**, one row per source line that was not loaded, keyed by
+  `(source_file, line_number)`: reason, column, original value, detail and the original fields.
+- Indexes: the two primary keys and `(country, id)`. Why only that one is in section 5.
 
-`app/validation.py` (pure, tested without a database). Parsing is strict on purpose: Pydantic's
-default coercion would accept `"on"` as a boolean or `"1e3"` and `"NaN"` as numbers.
+## 2. Cleaning and validation
 
-| Fixed and loaded | Rejected |
+`app/validation.py`: a Pydantic model with its own strict parsers, tested without a database.
+Pydantic's default coercion would accept `on` as a boolean or `1e3` as a number.
+
+| Fixed, then loaded | Rejected |
 |---|---|
-| Surrounding whitespace (`' Germany  '`) | Wrong number of fields |
-| Case of categories and countries (`MALE`, `uk` → `Male`, `UK`) | Text or signs in a number (`thirty`, `4O`, `-3`) |
-| Boolean synonyms (`Y`, `yes`, `true`, `N`, `no`, `false`) | Number outside its plausible range |
-| Extra decimals, rounded half up to one place | Value outside its catalog, unknown country |
-| Missing marker (empty, `n/a`, `?`, `unknown`, `null`) in an optional column → `NULL` | Missing marker in `ID`, `Country`, `Coffee_Intake` or `Caffeine_mg` |
-| | Boolean outside `0/1` and the synonyms (`2`, `-1`) |
+| Surrounding spaces or tabs (`' Germany  '`) | Wrong number of fields (13 or 17 instead of 16) |
+| Case of categories and countries (`MALE`, `uk`) | Text or a sign in a number (`thirty`, `4O`, `-3`) |
+| Boolean synonyms (`Y`, `yes`, `false`) | Number outside its plausible range |
+| More than one decimal, rounded half up | Unknown category or country; a boolean such as `2` |
+| Missing marker (empty, `n/a`, `?`, `unknown`) in an optional column, stored as `NULL` | Missing marker in one of the four required columns |
 
-A row is all or nothing: one invalid column rejects the whole row, and a rejected row never
-touches a record that is already stored.
+Nothing is guessed (`4O` is not read as 40) and one invalid column rejects the whole row.
 
-Numeric limits (inclusive). They are looser than the observed data on purpose: they exclude
-what is impossible or clearly a capture error, not what is merely unusual.
+Plausible ranges, inclusive. They are wider than the data on purpose: they only exclude what is
+impossible or clearly a capture error.
 
-| Column | Range | Column | Range |
-|---|---|---|---|
-| Age | 18–120 | BMI | 10–80 |
-| Coffee_Intake | 0–20 cups/day | Heart_Rate | 30–200 bpm |
-| Caffeine_mg | 0–2000 mg/day | Physical_Activity_Hours | 0–80 h/week |
-| Sleep_Hours | 1–16 | ID | 1–2,147,483,647 |
+| Age | Coffee_Intake | Caffeine_mg | Sleep_Hours | BMI | Heart_Rate | Physical_Activity_Hours |
+|---|---|---|---|---|---|---|
+| 18–120 | 0–20 | 0–2000 | 1–16 | 10–80 | 30–200 | 0–80 |
 
-Result with `data/coffee_health_raw.csv`: 10,012 rows read (plus 3 blank lines), **9,984
-loaded**, 28 not loaded. 56 loaded rows needed a fix and 9 have a missing optional value.
+Result: 10,012 rows read, 9,984 loaded (56 of them after a fix, 9 with a missing optional
+value) and 28 not loaded:
 
-| Reason | Rows | What |
+| Reason | Rows | Values |
 |---|---|---|
 | `out_of_range` | 6 | Age 150, 212; Sleep_Hours 25.0; Heart_Rate 0, 350; BMI 0 |
 | `not_numeric` | 5 | Age `thirty`, `4O`, `-3`; Sleep_Hours `seven`, `-1` |
-| `column_count` | 3 | Rows with 13 or 17 fields instead of 16 |
+| `column_count` | 3 | 13 or 17 fields |
 | `invalid_boolean` | 2 | Smoking `-1`, `2` |
-| `duplicate_exact` | 8 | Earlier copy of an ID, identical to the one kept |
-| `duplicate_conflict` | 4 | Earlier copy of an ID, different from the one kept |
+| `duplicate_exact` | 8 | See section 3 |
+| `duplicate_conflict` | 4 | See section 3 |
 
-Each of them, with line number and reason:
+Each one, with its line number and reason:
 
 ```sql
 select line_number, reason, column_name, raw_value, detail
 from load_rejects where source_file = 'coffee_health_raw.csv' order by line_number;
 ```
 
-The loader prints these counts and only commits if they reconcile with what the database
-holds (rows read = rejected + duplicates + loaded).
+The loader prints these counts and commits only if they reconcile with what the database
+holds: rows read = rejected + duplicates + loaded.
 
-## Duplicates
+## 3. Duplicates
 
-When an ID appears more than once, **the last valid occurrence in the file wins**: a later
-line is taken as a correction of an earlier one. The discarded occurrences are recorded in
-`load_rejects` as `duplicate_exact` or `duplicate_conflict`, with the line that replaced them
-(`superseded by line 3516`), so a conflict is never resolved silently. An invalid occurrence is
-a rejection, not a duplicate, and does not win. This is resolved in SQL over the staged rows,
-not in a Python dict, so it does not depend on the file fitting in memory.
+12 IDs appear twice. **The last valid occurrence in the file wins**: a later line is taken as a
+correction, which is also the rule when a newer file is loaded. The earlier line is not loaded
+and is recorded as `duplicate_exact` (8, identical once normalized) or `duplicate_conflict` (4,
+which differ in age and heart rate) together with the line that replaced it, so no conflict is
+resolved silently. An invalid occurrence is a rejection and never wins. I discarded "keep the
+first" and "load neither".
 
-## Filtering and pagination
+## 4. Filtering and pagination
 
-Four read-only routes, all usable from `/docs`: `GET /records`, `GET /records/summary`,
-`GET /rejects` and `GET /rejects/summary`.
+`GET /records`, used from `/docs`. Parameters and their SQL are in `app/filters.py`.
 
-**Filters** on `/records` (and the same ones on the summary):
+- **Filters**: any of several values for `country`, `gender`, `sleep_quality` and
+  `stress_level` (repeat the parameter; case and surrounding spaces are ignored); `smoking`;
+  and inclusive `min_`/`max_` ranges for `age`, `coffee_intake` and `bmi`. Different filters are
+  combined with AND. The list is short on purpose: every filter is a question about an index.
+- A filter leaves out the records that have no value in that column. In a response a missing
+  value is `null`, and numbers are JSON numbers.
+- A misspelled parameter (`min_agee`) is a 422 instead of being ignored, and every invalid
+  parameter of a request is reported in the same response, including `max_age` below `min_age`.
+  An unknown country is an empty page, not an error.
+- The filters become SQL in one pure function, tested without a database. Client values only
+  ever travel as query parameters.
+- **Pagination is by cursor (keyset), not by page number**:
+  `WHERE id > :after_id ORDER BY id LIMIT :n`. The response carries `next_after_id`, null on the
+  last page. 50 records per page by default, 200 at most. There is no `count(*)` per page: the
+  total comes from `GET /records/summary`, which returns the count and three averages per group.
 
-| Kind | Parameters | Behaviour |
+`GET /rejects` and `GET /rejects/summary` expose the rows that were not loaded.
+
+## 5. Scale
+
+**Loader.** It streams the file, validates in chunks of 10,000 rows, sends each chunk with
+`COPY` to a temporary table, and resolves duplicates and the upsert (`MERGE`, skipping rows that
+did not change) in SQL, in one transaction.
+
+| File | Time | Peak memory |
 |---|---|---|
-| Any of several values | `country`, `gender`, `sleep_quality`, `stress_level` | Repeat the parameter; case and surrounding spaces are ignored |
-| Yes / no | `smoking` | |
-| Inclusive range | `min_age`/`max_age`, `min_coffee_intake`/`max_coffee_intake`, `min_bmi`/`max_bmi` | Either end may be left open |
+| Real file, 10,012 rows | 0.5 s | 55 MiB |
+| 1,001,200 rows | 50 s, about 20,000 rows/s | 65 MiB |
 
-Different filters are combined with AND. I kept the list short on purpose: every filter is a
-question about whether it deserves an index.
+Memory depends on the chunk, not on the file: a 50,000-row chunk used 142 MiB and was no faster.
+About half of the time is validation in Python. 10 million rows would take 8 to 9 minutes.
 
-- A filter on a column leaves out the records that have no value in it; in a response a
-  missing value is `null`.
-- An unknown country is not an error, it returns an empty page. An unknown category is a 422
-  that lists the accepted values.
-- Parameters are a Pydantic model (`app/filters.py`), so a misspelled one (`min_agee`) is a 422
-  instead of being silently ignored, and every invalid parameter of a request is reported in
-  the same response, including `max_age` below `min_age`.
-- The filters become SQL in one pure function, `build_where`, tested without a database. Client
-  values only ever travel as query parameters.
+**Deep pages.** `EXPLAIN (ANALYZE, BUFFERS)` on 1 million rows, same page at the end of the
+table. Both plans are an index scan on the primary key; what changes is how much they read.
 
-**Pagination** is by cursor, not by page number: `WHERE id > :after_id ORDER BY id LIMIT :n`.
-The response carries `next_after_id` (null on the last page) and the client sends it back as
-`after_id`. Page size is 50 by default and 200 at most. One extra row is fetched to know whether
-another page exists, so there is no `count(*)`.
-
-Measured on 1 million rows, same page at the end of the table:
-
-| | Rows read | Time |
-|---|---|---|
-| Cursor (`id > ...`) | 51 | 0.06 ms |
-| `OFFSET 993400` | 993,451 | 122 ms |
-
-`OFFSET` reads and throws away every earlier row, so its cost grows with the page number; the
-cursor costs the same anywhere. The cursor is also stable if rows are added during a walk.
-What is given up: jumping to an arbitrary page, and a total in the list (the summary gives it).
-
-`/records/summary` groups by country, gender, sleep quality, stress level or whole cups of
-coffee and returns the count and three averages per group. Records with no value to group by
-form a group whose key is `null`, so the counts always add up to the list with the same filters.
-`/rejects` exposes `load_rejects` with the same pagination rules.
-
-## Scale (loader)
-
-The file is streamed and validated in chunks of 10,000 rows, each sent with `COPY` to a
-temporary table; duplicates and the upsert (`MERGE`, which skips rows that did not change) run
-in SQL. Everything is one transaction, guarded by an advisory lock so loads run one at a time.
-
-Measured on a development laptop (Windows, Postgres 17 in Docker):
-
-| File | Time | Rows/s | Peak process memory |
+| Query | Rows read | Buffers | Time |
 |---|---|---|---|
-| Real file, 10,012 rows | 0.5 s | — | 55 MiB |
-| 1,001,200 rows, chunk 10,000 (default) | 50 s | ~20,000 | 65 MiB |
-| 1,001,200 rows, chunk 50,000 | 50 s | ~20,000 | 142 MiB |
+| `WHERE id > 990005000 ORDER BY id LIMIT 51` | 51 | 5 | 0.06 ms |
+| `ORDER BY id LIMIT 51 OFFSET 993400` | 993,451 | 17,427 | 122 ms |
 
-Memory depends on the chunk size, not on the file size; a bigger chunk bought no speed, so
-the default is 10,000. About half of the time is row validation in Python, the rest is `COPY`
-and the final `MERGE`. Throughput varied between 18,800 and 20,200 rows/s across runs. Time
-grows linearly: 10 million rows would take roughly 8 to 9 minutes. With the API's
-`(country, id)` index in place the same load took 52.8 s, inside that run-to-run variation.
-
-Trade-offs and what I would change for tens of millions of rows:
-
-- One transaction keeps a failed load from leaving anything behind, at the cost of a long
-  transaction and a staging table about the size of the file. For very large initial loads I
-  would commit per chunk and keep a table of runs to resume from.
-- Validation is single-process. Splitting it across processes is the next step if throughput
-  matters; it complicates line numbering and atomicity, so it was left out.
-- Secondary indexes should be created after a bulk load, not maintained row by row during it.
-
-## Scale (API)
-
-Measured on a table of 998,400 rows (Ryzen 7 3700X, 32 GB, Windows 11, Postgres 17 in Docker).
-End-to-end times include validation and serialization; they are medians of 20 requests.
-
-| Request | Time |
-|---|---|
-| First page, no filters | 6.0 ms |
-| Last page, no filters | 7.0 ms |
-| First / last page, `country=Germany` | 7.2 / 6.7 ms |
-| A country that does not exist | 7.4 ms |
-| A filter with no matches and no index (`min_age=119`) | 47.5 ms |
-| Summary by gender, no filters | 183 ms |
+End to end, the first page and the last page both answer in about 7 ms.
 
 **Indexes.** The primary key serves the list and most filters: scanning from the cursor and
-skipping the rows that do not match finds a page almost at once when a filter matches a fair
-share of the table (a country is 5% of it; a combination matching 0.26% took 12 ms). I added
-one index,
-`(country, id)`, and not for the common case: for a country with few rows or none, such as a
-misspelled name, the primary key scan would read the whole table before answering with an
-empty page (110 ms on 1M rows without the index, 0.09 ms with it, and growing with the table).
-Its cost: inserts were 39% slower in isolation, although the full load, dominated by
-validation, did not change measurably; it takes 35 MB per 1.2M rows. One index per filter
-would multiply that cost for filters that the primary key already serves.
+skipping the rows that do not match fills a page quickly (0.2 ms for one country, 5% of the
+table). The one extra index, `(country, id)`, is for a country with few rows or none, such as a
+misspelled name: without it that request reads the whole table (110 ms), with it 0.09 ms. Its
+cost: the insert step alone is 39% slower, although the full load did not change measurably
+(52.8 s), and it takes 35 MB per 1.2 million rows.
 
-**Known worst cases**, accepted and bounded by the time limit below:
+**Connections.** A bounded pool (10 connections) and plain `def` routes. A request waits at most
+5 s for a connection and a query runs at most 5 s; past either limit, or with the database down,
+the API answers `503` instead of hanging. The pool tests a connection before lending it, so a
+database restart does not fail a request. All of it is configurable (`.env.example`). Sizing
+rule: worker processes × pool size must stay below Postgres' `max_connections`.
 
-- A filter without an index that matches almost nothing scans until it fills the page, or to
-  the end. At tens of millions of rows that would need its own `(column, id)` index, added
-  only for a filter that proves to be both frequent and selective.
-- The unfiltered summary reads the whole table: about 5 s near 27 million rows on this machine.
-  The answer at that size is a small table of aggregates refreshed at the end of each load. It
-  is not built: nothing needs it today.
+**Trade-offs and assumptions**
 
-**Connections.** Routes are plain `def` functions over the synchronous pool that the repo
-already had. The pool is bounded (10 connections by default) and so is time: a request waits at
-most 5 s for a connection and a query may run at most 5 s (`statement_timeout`, set on the
-pool's connections only, so the loader is not affected). When either limit is hit, or the
-database is down, the API answers `503` instead of hanging; with the database stopped it
-answered at once and recovered by itself when the database came back. The pool tests each
-connection before lending it, so a connection the server closed (a restart, an idle timeout)
-is replaced instead of failing a request; that costs one extra round trip, about 0.5 ms here,
-which the times above do not include. All four values are settings (`.env.example`). The rule for sizing: worker processes × pool size must stay below
-Postgres' `max_connections`. Past that point the next step is PgBouncer in front of Postgres,
-or async routes to hold more waiting requests per process; neither was needed here.
+- One load at a time, in a single transaction: a failure leaves nothing behind, at the cost of
+  a long transaction. For a much larger initial load I would commit per chunk with a table of
+  runs to resume from, validate in several processes and create secondary indexes afterwards.
+- A filter without an index that matches almost nothing scans to the end (48 ms on 1 million
+  rows), and the unfiltered summary reads the whole table (183 ms, so about 5 s near 27 million
+  rows). Both are cut by the 5 s limit. At that size I would add a `(column, id)` index for a
+  filter proven to be frequent and selective, and a small table of aggregates refreshed by the
+  loader. Neither is built: nothing needs them today.
+- For more traffic the next step is PgBouncer in front of Postgres, or async routes.
+- "Last occurrence wins" assumes the file is in export order, and that an ID is the same person
+  across files.
 
-Pool connections do not use server-side prepared statements: a cached generic plan cannot tell
-a rare country from a common one and went back to scanning the whole table (180 ms).
+## 6. Lint exceptions
 
-## Lint exceptions
+One: `# noqa: E402` on the two `app` imports in `scripts/load_data.py`. `make load` runs the
+script by path, which puts `scripts/` on `sys.path` instead of the repository root, so the root
+is added before those imports. The alternative was changing the Makefile. No `type: ignore`.
 
-- `# noqa: E402` on the two `app` imports in `scripts/load_data.py`: `python scripts/load_data.py`
-  puts `scripts/` on `sys.path`, not the repository root, so the root is added before those
-  imports. The alternative was changing the `make load` contract.
+## 7. How AI was used
 
-No `type: ignore`.
+I built this with an AI coding assistant (Claude Code), following spec-driven development with
+[spec-kit](https://github.com/github/spec-kit): a constitution with the project's principles
+and then, for each feature, specify → clarify → plan → tasks → analyze → implement. The
+artifacts are in `specs/` and `.specify/memory/constitution.md`.
+
+I set the rules and decided the ambiguous cases in the clarify step: what to reject, which
+duplicate wins, what to do with missing values, how filters treat case, the time limits. The
+assistant drafted specs, plans and tasks from those decisions, wrote the tests before the code,
+and ran the measurements. I ran and checked every step against my plan and tested the API by
+hand, which is how the 503 after a database restart was found and fixed.
