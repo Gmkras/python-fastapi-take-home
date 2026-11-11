@@ -634,6 +634,10 @@ def test_documentation_describes_every_route_and_parameter(client: TestClient) -
     assert (limit["minimum"], limit["maximum"], limit["default"]) == (1, 200, 50)
     assert schemas["Gender"]["enum"] == ["Male", "Female", "Other"]
     assert "#/components/schemas/Gender" in str(parameter("/records", "gender")["schema"])
+    # What "Add string item" pre-fills in /docs: a real country, not the placeholder "string".
+    for route in ("/records", "/records/summary"):
+        country_values = parameter(route, "country")["schema"]["anyOf"][0]["items"]
+        assert country_values["examples"] == ["Germany"], route
     assert parameter("/records/summary", "group_by")["required"] is True
     assert schemas["GroupBy"]["enum"] == [
         "country",

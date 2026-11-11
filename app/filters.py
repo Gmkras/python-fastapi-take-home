@@ -83,7 +83,8 @@ class RecordFilters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     country: Annotated[
-        list[str] | None,
+        # The example is what /docs pre-fills when a value is added, instead of "string".
+        list[Annotated[str, Field(examples=["Germany"])]] | None,
         BeforeValidator(_canonical_countries),
         Field(
             description="Country name. Repeat the parameter to match any of several. Case and"
