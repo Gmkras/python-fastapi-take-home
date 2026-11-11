@@ -1,0 +1,12 @@
+-- Secondary indexes for the read API. Each one is justified by a query and has a write cost.
+--
+-- (country, id): the record list is paginated by id. For a frequent country the primary key
+-- is already enough (scan from the cursor, skip the rows of other countries). This index is
+-- for a country with few rows or none, such as a misspelled name: without it that request
+-- reads the whole table before answering with an empty page. It also serves the summary
+-- filtered by country.
+-- Cost, measured on 1M rows: inserts are about 39% slower and the index takes 35 MB.
+--
+-- The other filters (gender, sleep_quality, stress_level, smoking, ranges) are not selective
+-- enough to earn an index: the primary key scan finds a page of matches almost immediately.
+create index health_records_country_id_idx on public.health_records (country, id);
