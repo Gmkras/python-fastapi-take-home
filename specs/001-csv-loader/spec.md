@@ -66,8 +66,8 @@ la base contiene exactamente 9.984 registros, todos dentro de los dominios y ran
 6. **Given** el archivo con BOM UTF-8 y finales de línea CRLF, **When** se carga, **Then** la
    cabecera se reconoce y el resultado es el mismo que con un archivo sin BOM y con finales LF.
 7. **Given** una fila bien formada con Age vacío (línea 1154) o BMI `'n/a'` (línea 7902),
-   **When** se carga, **Then** el registro se guarda con ese dato vacío y cuenta como "cargada con
-   datos faltantes".
+   **When** se carga, **Then** el registro se guarda con ese dato vacío y la fila cuenta como
+   "válida con datos faltantes".
 8. **Given** una fila con Country o Coffee_Intake vacío, **When** se carga, **Then** se rechaza
    con motivo "falta valor obligatorio" y la columna afectada.
 
@@ -89,7 +89,7 @@ resumen cuadra.
 **Acceptance Scenarios**:
 
 1. **Given** el archivo actual, **When** termina la carga, **Then** el resumen muestra: 10.012
-   filas de datos leídas, 3 en blanco, 9.996 válidas, 56 corregidas, 9 cargadas con datos
+   filas de datos leídas, 3 en blanco, 9.996 válidas, 56 corregidas, 9 válidas con datos
    faltantes, 16 rechazadas, 12 duplicadas (8 exactas y 4 en conflicto) y 9.984 registros en la
    base.
 2. **Given** el archivo actual, **When** termina la carga, **Then** los rechazos por columna son:
@@ -171,7 +171,7 @@ consumo de memoria no crece con el tamaño del archivo y que los conteos concili
 **Acceptance Scenarios**:
 
 1. **Given** un archivo de 1 millón de filas, **When** se carga, **Then** termina con los conteos
-   conciliados y su consumo de memoria es comparable al de cargar el archivo de 10.000 filas.
+   conciliados y cumple los límites de memoria y ritmo de SC-006.
 
 ---
 
@@ -188,7 +188,7 @@ consumo de memoria no crece con el tamaño del archivo y que los conteos concili
 - Valores con letras que parecen números (`4O`): se rechazan, no se adivinan.
 - Números con signo, notación científica, separador de miles, coma decimal, `NaN` o `Infinity`:
   se rechazan como no numéricos.
-- Enteros con decimales (`40.0` en Age): se rechazan como no enteros.
+- Enteros con decimales (`40.0` en Age): se rechazan como no numéricos (no son un entero).
 - Decimales con más de una cifra (`3.14`): se redondean a una cifra (`3.1`, mitad hacia arriba)
   y la fila cuenta como corregida; si tras redondear queda fuera de rango, se rechaza.
 - `None` en Health_Issues es un valor válido del dominio, no un faltante.
@@ -220,7 +220,8 @@ consumo de memoria no crece con el tamaño del archivo y que los conteos concili
   con un error que muestre lo esperado y lo encontrado.
 - **FR-003**: El sistema DEBE omitir las líneas en blanco y contarlas aparte.
 - **FR-004**: El sistema DEBE identificar cada fila por su número de línea en el archivo,
-  contando la cabecera como línea 1.
+  contando la cabecera como línea 1. Si un registro ocupa varias líneas (un campo entre comillas
+  con saltos de línea), se usa la línea donde termina.
 - **FR-005**: El sistema DEBE rechazar las filas cuyo número de campos no sea 16.
 
 **Normalización (la fila se carga y cuenta como corregida)**
@@ -297,12 +298,14 @@ consumo de memoria no crece con el tamaño del archivo y que los conteos concili
 **Resumen y conciliación**
 
 - **FR-025**: Al terminar, el sistema DEBE mostrar: filas de datos leídas, en blanco, válidas,
-  corregidas, cargadas con datos faltantes, rechazadas (total y por motivo), duplicadas
-  (exactas y en conflicto), insertadas,
-  actualizadas, sin cambios y total de registros en la base.
-- **FR-026**: El sistema DEBE verificar que leídas = rechazadas + duplicadas + cargadas y que el
-  número de filas no cargadas registradas para el archivo coincide con rechazadas + duplicadas.
-  Si no se cumple, DEBE terminar con error sin confirmar cambios.
+  corregidas, válidas con datos faltantes, rechazadas (total y por motivo), duplicadas
+  (exactas y en conflicto), insertadas, actualizadas, sin cambios y total de registros en la
+  base. "Corregidas" y "con datos faltantes" se cuentan sobre las filas válidas, incluidas las
+  que después se descartan por duplicadas.
+- **FR-026**: El sistema DEBE verificar que: leídas = rechazadas + duplicadas + cargadas;
+  cargadas = insertadas + actualizadas + sin cambios; el número de filas no cargadas registradas
+  para el archivo = rechazadas + duplicadas; y el total de registros en la base = total antes de
+  la carga + insertadas. Si algo no se cumple, DEBE terminar con error sin confirmar cambios.
 - **FR-027**: El proceso DEBE terminar con código de salida distinto de cero ante cualquier error
   fatal (cabecera, archivo, conexión, conciliación) y con cero en caso de éxito, aunque haya
   filas rechazadas.

@@ -113,9 +113,9 @@ queda en `scripts/load_data.py`, que es lo que ejecuta `make load`, y se prueba 
 main(): argparse → connect(timeout=10) → load_csv(conn, path, chunk_size) → print summary → commit
 load_csv (sin commit):
   1. pg_advisory_xact_lock
-  2. leer cabecera → error si ≠ EXPECTED_HEADER
-  3. DELETE FROM load_rejects WHERE source_file = name
-  4. CREATE TEMP TABLE _staging ... ON COMMIT DROP
+  2. leer cabecera → check_header() → error si ≠ EXPECTED_HEADER
+  3. contar rows_before; DELETE FROM load_rejects WHERE source_file = name
+  4. DROP TABLE IF EXISTS _staging; CREATE TEMP TABLE _staging (..., raw_fields) ON COMMIT DROP
   5. por cada bloque de chunk_size filas:
        parse_row → válidas | rechazos
        COPY válidas → _staging ; COPY rechazos → load_rejects

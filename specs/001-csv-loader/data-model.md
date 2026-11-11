@@ -51,9 +51,13 @@
 
 ## 3. `_staging` — tabla temporal de la carga
 
-`CREATE TEMP TABLE _staging (line_no integer NOT NULL, <las 16 columnas de health_records
-sin loaded_at>) ON COMMIT DROP`.
+`DROP TABLE IF EXISTS _staging`, y luego `CREATE TEMP TABLE _staging (line_no integer NOT NULL,
+<las 16 columnas de health_records sin loaded_at>, raw_fields text[] NOT NULL) ON COMMIT DROP`.
 
+- El `DROP ... IF EXISTS` permite dos cargas dentro de una misma transacción (así corren los
+  tests de idempotencia).
+- `raw_fields` guarda los campos originales de la fila: si resulta ser un duplicado descartado,
+  `load_rejects` conserva la fila original (FR-020).
 - Recibe solo filas válidas, por `COPY`.
 - Sin `CHECK` ni PK: el validador ya filtró y los IDs pueden repetirse.
 - Desaparece al confirmar o deshacer la transacción.
@@ -72,6 +76,7 @@ sin loaded_at>) ON COMMIT DROP`.
 | `Rejection` | `dataclass(frozen)` | `line_number`, `reason`, `column_name`, `raw_value`, `detail`, `raw_fields` |
 | `ParsedRow` | `dataclass(frozen)` | `line_number`, `record`, `fixed: frozenset[str]`, `missing: frozenset[str]` |
 | `parse_row(line_number, fields)` | función | `ParsedRow \| Rejection` |
+| `check_header(fields)` | función | No devuelve nada; lanza `HeaderError` (con esperado y encontrado) si la cabecera no es `EXPECTED_HEADER` |
 
 ## 5. Flujo de una fila
 
@@ -91,7 +96,10 @@ línea del CSV
 - `read = rejected + duplicates + winners`
 - `winners = inserted + updated + unchanged`
 - `count(load_rejects WHERE source_file = f) = rejected + duplicates`
-- `valid = read − rejected`; `fixed ≤ valid`; `with_missing ≤ valid`
+- `rows_in_table = rows_before + inserted` (`rows_before` se cuenta al empezar, ya con el bloqueo
+  tomado; vale aunque la tabla tenga datos de otros archivos)
+- `valid = read − rejected`; `fixed ≤ valid`; `with_missing ≤ valid` (`fixed` y `with_missing` se
+  cuentan sobre las filas válidas, incluidas las duplicadas descartadas)
 
 Valores esperados con `data/coffee_health_raw.csv`: `read` 10.012, `blank` 3, `rejected` 16,
 `valid` 9.996, `duplicates` 12 (8 exactos y 4 en conflicto), `winners` 9.984, `fixed` 56,

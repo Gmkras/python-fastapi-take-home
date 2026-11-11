@@ -271,7 +271,9 @@ mantienen.
 ## R15. Medición de escala
 
 **Decision**: script de apoyo `scripts/make_big_csv.py` que replica el CSV real N veces
-desplazando los IDs (`id + k * 10.000.000`), conservando la suciedad del original. Se mide con
+desplazando los IDs (`id + k * 10.000.000`), conservando la suciedad del original. Como el ID
+máximo es 2.147.483.647, el script admite como mucho 214 copias (unos 2,1 millones de filas);
+con más, los IDs se saldrían de rango y la medición contaría rechazos en vez de cargas. Se mide con
 1 millón de filas: tiempo total, filas/s y memoria pico del proceso
 (`psutil` no está disponible; se usa `tracemalloc` para el pico de memoria de Python y el
 Administrador de tareas o `/usr/bin/time -v` como referencia).

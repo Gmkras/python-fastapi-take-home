@@ -5,7 +5,7 @@
 ## Invocación
 
 ```text
-uv run python scripts/load_data.py <csv_path> [--chunk-size N]
+uv run python scripts/load_data.py <csv_path> [--chunk-size N] [--profile-memory]
 make load        # = uv run python scripts/load_data.py data/coffee_health_raw.csv
 ```
 
@@ -13,6 +13,7 @@ make load        # = uv run python scripts/load_data.py data/coffee_health_raw.c
 |---|---|---|---|
 | `csv_path` | ruta | — | Obligatorio; archivo legible |
 | `--chunk-size` | entero | 50000 | ≥ 1 |
+| `--profile-memory` | bandera | desactivada | Añade al resumen el pico de memoria de Python (`tracemalloc`); ralentiza la carga, solo para medir |
 
 Entorno: `DATABASE_URL` (vía `.env` y `app.config.settings`).
 
