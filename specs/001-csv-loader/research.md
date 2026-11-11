@@ -20,8 +20,9 @@ forma estricta y normaliza. Los rangos se declaran con `Field(ge=, le=)` y los c
 - La coerción por defecto de Pydantic es demasiado permisiva para un export sucio (acepta
   `" 40 "`, `"on"`/`"off"`/`"t"`/`"f"` como booleanos, `"1e3"`, `"NaN"` y `"Infinity"` como
   decimales). Por eso el parseo lo hacen validadores propios con
-  `re.fullmatch(r"\d+")` y `re.fullmatch(r"\d+(\.\d+)?")`, y `Decimal`, nunca `float`.
-  `str.isdigit()` no sirve: acepta dígitos no ASCII como `"４０"` o `"²"`.
+  `re.fullmatch(r"[0-9]+")` y `re.fullmatch(r"[0-9]+(\.[0-9]+)?")`, y `Decimal`, nunca `float`.
+  Ni `str.isdigit()` ni `\d` sirven: aceptan dígitos no ASCII como `"４０"` (corregido al
+  implementar: el test de `"４０"` falló con `\d`).
 - El contexto de validación permite saber qué columnas se corrigieron sin comparar después
   representaciones de texto (comparar `"3"` con `Decimal("3.0")` daría falsos "corregidos").
 
@@ -132,7 +133,8 @@ explicar, sin resolver nada que psycopg no resuelva).
 1. `open(path, encoding="utf-8-sig", newline="")` + `csv.reader`; el número de línea es
    `reader.line_num` (línea física donde termina el registro; la cabecera es la línea 1).
    `utf-8-sig` quita el BOM; `newline=""` deja que `csv` maneje CRLF y comillas.
-2. Se valida por bloques de `--chunk-size` filas (por defecto 50.000).
+2. Se valida por bloques de `--chunk-size` filas (por defecto 10.000; el plan decía 50.000 y
+   se bajó tras medir, ver R15).
 3. Por bloque, dos `COPY ... FROM STDIN` seguidos con `cursor.copy()` y `write_row()`: las
    válidas a `_staging` (tabla temporal `ON COMMIT DROP`, con `line_no`) y los rechazos a
    `load_rejects`. Dos `COPY` no pueden estar abiertos a la vez en la misma conexión; por eso
@@ -278,9 +280,37 @@ con más, los IDs se saldrían de rango y la medición contaría rechazos en vez
 (`psutil` no está disponible; se usa `tracemalloc` para el pico de memoria de Python y el
 Administrador de tareas o `/usr/bin/time -v` como referencia).
 
-**Estimación previa** (no medida): validación a ~51.600 filas/s, más `csv` y `COPY` →
-30.000-40.000 filas/s de extremo a extremo. 10 millones de filas tardarían entre 4 y 6 minutos
-más el `MERGE`. Los valores reales se escriben aquí y en NOTES.md tras medir.
+**Medición** (2026-11-11, portátil de desarrollo con Windows, Postgres 17 en Docker, base
+vacía, un solo proceso). El archivo grande son 100 copias del real: 1.001.200 filas, 77 MB.
+Memoria pico = `PeakWorkingSetSize` del proceso (API de Windows); el proceso recién importado
+ocupa 43 MiB.
+
+| Archivo | Bloque | Tiempo | Filas/s | Memoria pico |
+|---|---|---|---|---|
+| Real (10.012 filas) | 10.000 o 50.000 | 0,5 s | — | 55 MiB |
+| 1 M | 50.000 | 50,5 s | 19.845 | 142 MiB |
+| 1 M | 10.000 | 49,6 s | 20.172 | 65 MiB |
+| 1 M | 5.000 | 53,4 s | 18.757 | 56 MiB |
+| 1 M | 2.000 | 49,7 s | 20.131 | 50 MiB |
+
+Con `--profile-memory` y bloque 10.000, el pico de objetos Python (`tracemalloc`) es 17,5 MiB;
+la carga tarda 169 s porque `tracemalloc` la frena, así que solo sirve para medir memoria.
+Conteos del archivo grande: 998.400 cargadas, 1.600 rechazadas, 1.200 duplicadas (100 veces
+los del archivo real), y los invariantes cuadran.
+
+**Conclusiones**:
+- El tamaño del bloque no cambia la velocidad y sí la memoria. Con 50.000 (el valor del plan) el
+  pico es 2,6 veces el del archivo real e incumple SC-006 (máximo el doble); con 10.000 es
+  1,2 veces. **El valor por defecto pasa a 10.000.**
+- SC-005 se cumple con margen (0,5 s frente a 10 s). FR-028 se cumple: la memoria depende del
+  bloque, no del archivo.
+- El ritmo de SC-006 (20.000 filas/s) queda **en el límite**: entre 18.800 y 20.200 según la
+  ejecución. La estimación previa (30.000-40.000) era optimista. Perfil con `cProfile` sobre
+  200.000 filas: la validación (`parse_row`, 16 validadores Python por fila) es más o menos la
+  mitad del tiempo; el resto es `COPY` (~10 %), serializar la fila original (~8 %) y el trabajo
+  de Postgres, incluido el `MERGE` final. No hay un arreglo barato: subir de orden de magnitud
+  exige validar en varios procesos o sustituir Pydantic por funciones puras (R1).
+- El tiempo crece de forma lineal: 10 millones de filas serían unos 8 o 9 minutos.
 
 **Alternatives considered**: validación en paralelo con `multiprocessing` (complica el orden de
 líneas y la atomicidad; no hace falta para el objetivo).

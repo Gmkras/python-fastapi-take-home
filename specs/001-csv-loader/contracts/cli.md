@@ -12,7 +12,7 @@ make load        # = uv run python scripts/load_data.py data/coffee_health_raw.c
 | Argumento | Tipo | Defecto | Regla |
 |---|---|---|---|
 | `csv_path` | ruta | — | Obligatorio; archivo legible |
-| `--chunk-size` | entero | 50000 | ≥ 1 |
+| `--chunk-size` | entero | 10000 | ≥ 1 |
 | `--profile-memory` | bandera | desactivada | Añade al resumen el pico de memoria de Python (`tracemalloc`); ralentiza la carga, solo para medir |
 
 Entorno: `DATABASE_URL` (vía `.env` y `app.config.settings`).
